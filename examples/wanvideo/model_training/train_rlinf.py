@@ -4,7 +4,7 @@ from PIL import Image
 from diffsynth import load_state_dict
 from diffsynth.pipelines.wan_video_new import WanVideoPipeline, ModelConfig
 from diffsynth.trainers.utils import DiffusionTrainingModule, ModelLogger, launch_training_task, wan_parser
-from diffsynth.trainers.utils import RLinfNpyDataset
+from diffsynth.trainers.utils import RLinfNpyDataset, LiberoRGBDDataset
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 # --- Patch Start: 允许加载包含 set 的权重文件 ---
@@ -106,6 +106,11 @@ class WanTrainingModule(DiffusionTrainingModule):
             "min_timestep_boundary": self.min_timestep_boundary,
             "idx":data["idx"] if "idx" in data else None,
         }
+
+        # Add action to inputs if it exists in data
+        if "action" in data:
+            assert torch.isfinite(data["action"]).all(), f"Action tensor has NaN/Inf. Shape: {data['action'].shape}, min: {data['action'].min()}, max: {data['action'].max()}"
+            inputs_shared["action"] = data["action"]
         
         # Extra inputs
         # print(f'====WanTrainingModule forward_preprocess extra_inputs: {self.extra_inputs}====')
@@ -146,7 +151,14 @@ if __name__ == "__main__":
     parser.add_argument("--static_video_prob", type=float, default=0.15, help="Probability of replacing the sample with a static video (action=0)")
     parser.add_argument("--use_wow_checkpoint", action="store_true",help="Whether to load the WoW checkpoint to overwrite the base model weights.")
     parser.add_argument("--val_interval", type=int, default=5, help="Validation interval in epochs")
-    parser.add_argument("--dataset",type=str,default="RLinfNpyDataset",help="Dataset type for training")
+    parser.add_argument("--dataset", type=str, default="RLinfNpyDataset", help="Dataset type for training")
+    # LiberoRGBDDataset arguments
+    parser.add_argument("--libero_dataset_name", type=str, default=None, help="HuggingFace dataset name for LiberoRGBDDataset")
+    parser.add_argument("--libero_context_frames", type=int, default=5, help="Number of context frames for LiberoRGBDDataset")
+    parser.add_argument("--libero_prediction_frames", type=int, default=4, help="Number of prediction frames for LiberoRGBDDataset")
+    parser.add_argument("--libero_image_size", type=int, nargs=2, default=[256, 256], help="Image size (H W) for LiberoRGBDDataset")
+    parser.add_argument("--libero_action_dim", type=int, default=7, help="Action dimension for LiberoRGBDDataset")
+    parser.add_argument("--libero_max_depth", type=float, default=5.0, help="Max depth value for LiberoRGBDDataset")
     args = parser.parse_args()
 
     if args.dataset == "RLinfNpyDataset":
@@ -161,7 +173,27 @@ if __name__ == "__main__":
             num_frames=args.num_frames 
         )
     else:
-        raise NotImplementedError('this dataset type not implemented')
+        _libero_kwargs = dict(
+            dataset_name=args.libero_dataset_name,
+            context_frames=args.libero_context_frames,
+            prediction_frames=args.libero_prediction_frames,
+            image_size=tuple(args.libero_image_size),
+            action_dim=args.libero_action_dim,
+            max_depth=args.libero_max_depth,
+        )
+        # Build val_dataset first so we can detect whether a fallback split occurred.
+        val_dataset = LiberoRGBDDataset(**_libero_kwargs, split="validation", repeat=1)
+
+        dataset = LiberoRGBDDataset(**_libero_kwargs, split="train", repeat=args.dataset_repeat)
+        # If val_dataset fell back to the train split (no dedicated validation split),
+        # trim train dataset to the first 90 % of episodes to avoid overlap.
+        if val_dataset._fallback_split is not None:
+            n_all = len(dataset.episodes)
+            val_ratio = dataset._fallback_val_ratio   # 0.1
+            train_end = int(n_all * (1.0 - val_ratio))
+            dataset.episodes = dataset.episodes[:train_end]
+            print(f"[LiberoRGBDDataset] Auto-split (fallback): "
+                  f"using episodes [0, {train_end}) ({len(dataset.episodes)} episodes) as 'train'.")
     # ----------------------
     model = WanTrainingModule(
         model_paths=args.model_paths,

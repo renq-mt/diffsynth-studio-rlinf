@@ -462,6 +462,264 @@ class RLinfNpyDataset(torch.utils.data.Dataset):
             "action": action_tensor,
         }
 
+class LiberoRGBDDataset(torch.utils.data.Dataset):
+    """
+    LIBERO RGB-D dataset loader for depth-conditioned world model training.
+
+    Loads from HuggingFace LeRobot format datasets (e.g. binhng/libero_object_lerobot_mask_depth).
+    Each sample contains context + prediction frames with RGB, depth, and actions.
+
+    Dataset format:
+        observation.images.image       : RGB frames (PIL Image)
+        observation.images.image_depth : depth maps (PIL Image or ndarray)
+        action                         : robot action vector (7D)
+        episode_index                  : episode identifier
+    """
+
+    RGB_KEY = "observation.images.image"
+    DEPTH_KEY = "observation.images.image_depth"
+    ACTION_KEY = "action"
+    EPISODE_KEY = "episode_index"
+
+    def __init__(
+        self,
+        dataset_name: str,
+        context_frames: int = 5,
+        prediction_frames: int = 4,
+        image_size=(256, 256),
+        action_dim: int = 7,
+        max_depth: float = 5.0,
+        split: str = "train",
+        repeat: int = 1,
+    ):
+        self.dataset_name = dataset_name
+        from datasets import load_dataset
+        self.context_frames = context_frames
+        self.prediction_frames = prediction_frames
+        self.window_size = context_frames + prediction_frames
+        self.num_frames = context_frames + prediction_frames  # For consistency with RLinfNpyDataset
+        self.image_size = image_size
+        self.action_dim = action_dim
+        self.max_depth = max_depth
+        self.repeat = repeat
+
+        self._fallback_val_ratio = 0.1   # ratio reserved for auto val split
+        self._fallback_split = None       # non-None when we fell back to "train"
+        try:
+            self.dataset = load_dataset(dataset_name, split=split, trust_remote_code=True)
+        except ValueError as e:
+            if split != "train":
+                warnings.warn(
+                    f"Split '{split}' not found in dataset '{dataset_name}' ({e}). "
+                    f"Falling back to split='train' and using the last "
+                    f"{int(self._fallback_val_ratio * 100)}% of episodes as '{split}'."
+                )
+                self.dataset = load_dataset(dataset_name, split="train", trust_remote_code=True)
+                self._fallback_split = split
+            else:
+                raise
+        self._build_index()
+        # Auto-split: when there is no dedicated val/test split in the dataset,
+        # carve out the last 10% of episodes for validation and keep the
+        # first 90% for training.
+        if self._fallback_split is not None:
+            n = len(self.episodes)
+            val_start = int(n * (1.0 - self._fallback_val_ratio))
+            # requested split was validation/test → keep tail
+            self.episodes = self.episodes[val_start:]
+            print(f"[LiberoRGBDDataset] Auto-split (fallback): "
+                  f"using episodes [{val_start}, {n}) ({len(self.episodes)} episodes) "
+                  f"as '{self._fallback_split}'.")
+
+    def _build_index(self):
+        if self._build_index_from_meta():
+            return
+        self.episodes = []
+        episode_start = 0
+        current_ep = None
+        for i in range(len(self.dataset)):
+            ep = self.dataset[i].get(self.EPISODE_KEY, i)
+            if current_ep is not None and ep != current_ep:
+                self._add_episode(episode_start, i)
+                episode_start = i
+            current_ep = ep
+        if current_ep is not None:
+            self._add_episode(episode_start, len(self.dataset))
+
+    def _build_index_from_meta(self):
+        if not os.path.isdir(self.dataset_name):
+            return False
+        meta_path = os.path.join(self.dataset_name, "meta", "episodes.jsonl")
+        if not os.path.exists(meta_path):
+            return False
+
+        self.episodes = []
+        episode_start = 0
+        with open(meta_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                episode = json.loads(line)
+                episode_len = int(episode["length"])
+                episode_end = episode_start + episode_len
+                self._add_episode(episode_start, episode_end)
+                episode_start = episode_end
+        return True
+
+    def _add_episode(self, start, end):
+        """Add episode information for random sampling."""
+        if end - start < self.window_size:
+            return  # Skip episodes that are too short
+        # Store episode info: (start_index, end_index, total_length)
+        self.episodes.append((start, end, end - start))
+
+    def _load_rgb(self, item):
+        """Load RGB image as PIL Image (uint8 [0, 255])."""
+        import numpy as np
+        img = item.get(self.RGB_KEY)
+        if img is None:
+            # Return black image
+            return Image.new("RGB", (self.image_size[1], self.image_size[0]), (0, 0, 0))
+
+        if not isinstance(img, Image.Image):
+            # Convert array to PIL Image
+            img_array = np.array(img)
+            # If image is in [0, 1] float range, convert to [0, 255] uint8
+            if img_array.max() <= 1.0:
+                img_array = (img_array * 255).clip(0, 255).astype(np.uint8)
+            img = Image.fromarray(img_array)
+
+        # Resize to target size
+        img = img.resize((self.image_size[1], self.image_size[0]), Image.BILINEAR)
+        return img
+
+    def _load_depth(self, item):
+        """Load depth map as PIL Image (uint8 [0, 255]) - grayscale."""
+        import numpy as np
+        depth = item.get(self.DEPTH_KEY)
+        if depth is None:
+            # Return white depth map (max depth)
+            return Image.new("L", (self.image_size[1], self.image_size[0]), 255)
+
+        if isinstance(depth, Image.Image):
+            # Convert PIL Image to array, convert to grayscale if needed
+            depth = np.array(depth).astype(np.float32)
+        else:
+            depth = np.array(depth).astype(np.float32)
+
+        # Handle multi-channel depth (e.g., RGB-encoded depth)
+        # Take the first channel or convert to grayscale
+        if depth.ndim == 3:
+            # If depth has shape (H, W, C), take first channel or use grayscale conversion
+            if depth.shape[2] == 1:
+                depth = depth[:, :, 0]
+            elif depth.shape[2] == 3:
+                # RGB-encoded depth: use standard grayscale conversion
+                # Or just take the red channel if it's single-channel data encoded as RGB
+                depth = depth[:, :, 0]  # Take first channel
+            else:
+                depth = depth[:, :, 0]  # Take first channel
+
+        # Now depth should be 2D (H, W)
+        assert depth.ndim == 2, f"Depth should be 2D after processing, got shape {depth.shape}"
+
+        # Normalize depth to [0, 1]
+        if depth.max() <= 1.0 and depth.max() > 0:
+            # Already normalized
+            depth_normalized = depth
+        elif depth.max() > 1.0:
+            # Raw depth values, normalize by max_depth
+            depth_normalized = np.clip(depth / self.max_depth, 0.0, 1.0)
+        else:
+            # All zeros
+            depth_normalized = depth
+
+        # Convert to uint8 [0, 255] PIL Image (explicitly grayscale)
+        depth_uint8 = (depth_normalized * 255).astype(np.uint8)
+        return Image.fromarray(depth_uint8, mode='L').resize(
+            (self.image_size[1], self.image_size[0]), Image.NEAREST
+        )
+
+    def _load_action(self, item) -> torch.Tensor:
+        import numpy as np
+        action = item.get(self.ACTION_KEY)
+        if action is None:
+            return torch.zeros(self.action_dim)
+        if isinstance(action, np.ndarray):
+            return torch.from_numpy(action.astype(np.float32))
+        return torch.tensor(action, dtype=torch.float32)
+
+    def __len__(self):
+        return len(self.episodes) * self.repeat
+
+    def __getitem__(self, idx):
+        """Random sampling strategy consistent with RLinfNpyDataset."""
+        episode_idx = idx % len(self.episodes)
+        episode_start, episode_end, episode_length = self.episodes[episode_idx]
+
+        # Debug: print first few calls to understand data
+        if idx < 3:
+            print(f"[DEBUG] idx={idx}, episode_idx={episode_idx}, episode_length={episode_length}, num_frames={self.num_frames}")
+
+        # Random sampling strategy (consistent with RLinfNpyDataset)
+        import numpy as np
+
+        if episode_length > (self.num_frames - 1):
+            if np.random.rand() < 0.95:
+                # 95% 随机采样 - 第0帧固定 + 从start_idx开始的连续片段（与RLinfNpyDataset一致）
+                if episode_length > 256:
+                    start_idx = np.random.randint(0, 250)
+                else:
+                    start_idx = np.random.randint(0, episode_length - self.num_frames + 2)
+
+                consecutive_ids = np.arange(start_idx, start_idx + self.num_frames - 1)
+                frame_ids = np.concatenate([[0], consecutive_ids])
+                # Ensure frame_ids don't exceed episode length
+                frame_ids = np.clip(frame_ids, 0, episode_length - 1)
+            else:
+                # 5% 使用硬编码 frame_ids pattern - 第0帧重复5次，然后连续帧
+                frame_ids = np.array([0,0,0,0,0,1,2,3,4,5,6,7,8][:self.num_frames])
+                # Ensure we have enough frames
+                while len(frame_ids) < self.num_frames:
+                    frame_ids = np.append(frame_ids, frame_ids[-1] + 1)
+                    frame_ids[-1] = min(frame_ids[-1], episode_length - 1)
+        else:
+            raise ValueError(f"Episode length={episode_length} is too small for num_frames={self.num_frames}")
+
+        # Load frames using the sampled frame_ids
+        rgb_frames, depth_frames, actions = [], [], []
+        for frame_id in frame_ids:
+            actual_idx = int(episode_start + frame_id)
+            item = self.dataset[actual_idx]
+            rgb_frames.append(self._load_rgb(item))
+            depth_frames.append(self._load_depth(item))
+            actions.append(self._load_action(item))
+
+        # rgb_frames are already PIL Images (uint8 [0, 255])
+        video_list = rgb_frames
+
+        action_tensor = torch.stack(actions)  # (num_frames, action_dim)
+        # Zero out first frame action (context frame convention)
+        action_tensor[0] = torch.tensor([0., 0., 0., 0., 0., 0., -1.])
+
+        # Convert depth PIL Images to tensor
+        import torchvision.transforms.functional as TF
+        depth_tensors = [TF.to_tensor(d) for d in depth_frames]  # Each is [1, H, W] in [0, 1]
+        depth_tensor = torch.stack(depth_tensors)  # (num_frames, 1, H, W)
+
+        # Sanity checks to ensure data is valid
+        assert torch.isfinite(action_tensor).all(), f"Action has NaN/Inf: {action_tensor}"
+        assert torch.isfinite(depth_tensor).all(), f"Depth has NaN/Inf: min={depth_tensor.min()}, max={depth_tensor.max()}"
+        assert depth_tensor.min() >= 0.0 and depth_tensor.max() <= 1.0, f"Depth out of [0,1] range: min={depth_tensor.min()}, max={depth_tensor.max()}"
+
+        return {
+            "video": video_list,
+            "reference_image": [video_list[0]],
+            "action": action_tensor,
+            "depth": depth_tensor,  # (num_frames, 1, H, W) in [0,1]
+        }
+    
 class DiffusionTrainingModule(torch.nn.Module):
     def __init__(self):
         super().__init__()
@@ -670,7 +928,7 @@ def launch_training_task(
         for data in tqdm(dataloader):
             with accelerator.accumulate(model):
                 optimizer.zero_grad()
-                if dataset.load_from_cache:
+                if getattr(dataset, 'load_from_cache', False):
                     loss = model({}, inputs=data)
                 else:
                     loss = model(data)

@@ -5,12 +5,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 accelerate launch \
   --width 256 \
   --num_frames 13 \
   --dataset_repeat 1 \
-  --model_paths '[
-    ["/mnt/project_rlinf/jzn/workspace/DiffSynth-Studio/ckpt/diffusion_pytorch_model-00001-of-00003.safetensors",
-     "/mnt/project_rlinf/jzn/workspace/DiffSynth-Studio/ckpt/diffusion_pytorch_model-00002-of-00003.safetensors",
-     "/mnt/project_rlinf/jzn/workspace/DiffSynth-Studio/ckpt/diffusion_pytorch_model-00003-of-00003.safetensors"],
-    "/mnt/project_rlinf/jzn/workspace/DiffSynth-Studio/ckpt/Wan2.2_VAE.pth"
-  ]' \
+  --model_paths '[["/workspace/qian.ren/robot_vla_cuda/gac_wm/diffsynth-studio-mt/models/Wan-AI/Wan2.2-TI2V-5B/diffusion_pytorch_model-00001-of-00003.safetensors","/workspace/qian.ren/robot_vla_cuda/gac_wm/diffsynth-studio-mt/models/Wan-AI/Wan2.2-TI2V-5B/diffusion_pytorch_model-00002-of-00003.safetensors","/workspace/qian.ren/robot_vla_cuda/gac_wm/diffsynth-studio-mt/models/Wan-AI/Wan2.2-TI2V-5B/diffusion_pytorch_model-00003-of-00003.safetensors"],"/workspace/qian.ren/robot_vla_cuda/gac_wm/diffsynth-studio-mt/models/Wan-AI/Wan2.2-TI2V-5B/models_t5_umt5-xxl-enc-bf16.pth","/workspace/qian.ren/robot_vla_cuda/gac_wm/diffsynth-studio-mt/models/Wan-AI/Wan2.2-TI2V-5B/Wan2.2_VAE.pth"]' \
   --learning_rate 1e-5 \
   --num_epochs 100000 \
   --remove_prefix_in_ckpt "pipe.dit." \
@@ -22,4 +17,4 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 accelerate launch \
   --val_interval 50 \
   --save_epochs 50 \
   --dataset RLinfNpyDataset \
-  --dataset_base_path /mnt/project_rlinf/jzn/workspace/latest/RLinf/dataset_for_posttrain_worldmodel_libero_spatial/base_policy_rollout
+  --dataset_base_path /workspace/qian.ren/huggingDown/RLinf/RLinf-Wan-LIBERO-Spatial/dataset
