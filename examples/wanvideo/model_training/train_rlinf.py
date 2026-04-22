@@ -34,6 +34,7 @@ class WanTrainingModule(DiffusionTrainingModule):
         use_dual_branch=False,         # new: enable RGB/depth dual-branch
         depth_pretrain_checkpoint=None, # new: optional separate pretrain for depth branch
         rgb_pretrain_checkpoint=None,   # new: load rgb-only ckpt into pipe.dit then freeze it
+        freeze_rgb_dit=True,            # new: freeze RGB dit in dual-branch (stage-1); set False for stage-2 joint finetune
     ):
         super().__init__()
         # Load models
@@ -72,12 +73,16 @@ class WanTrainingModule(DiffusionTrainingModule):
         self.use_dual_branch = use_dual_branch
         if use_dual_branch:
             import copy
-            print("🔀 Dual-branch mode: initializing depth_dit from RGB dit weights.")
-            # Deep-copy the RGB DiT as the depth branch starting point
+            print("Dual-branch mode: initializing depth_dit from RGB dit weights.")
             self.pipe.depth_dit = copy.deepcopy(self.pipe.dit)
             if depth_pretrain_checkpoint is not None and os.path.exists(depth_pretrain_checkpoint):
                 print(f"   Loading depth branch pretrain from: {depth_pretrain_checkpoint}")
-                sd = torch.load(depth_pretrain_checkpoint, map_location="cpu", weights_only=False)
+                from diffsynth.models import load_state_dict as _load_sd
+                sd = _load_sd(depth_pretrain_checkpoint, torch_dtype=torch.bfloat16, device="cpu")
+                if all(k.startswith("pipe.depth_dit.") for k in list(sd.keys())[:5]):
+                    sd = {k[len("pipe.depth_dit."):]: v for k, v in sd.items()}
+                elif all(k.startswith("pipe.dit.") for k in list(sd.keys())[:5]):
+                    sd = {k[len("pipe.dit."):]: v for k, v in sd.items()}
                 msg = self.pipe.depth_dit.load_state_dict(sd, strict=False)
                 print(f"   Missing: {len(msg.missing_keys)}, Unexpected: {len(msg.unexpected_keys)}")
             # Build one CrossBranchAttention per DiT block (zero-init output proj)
@@ -99,7 +104,7 @@ class WanTrainingModule(DiffusionTrainingModule):
         )
 
         # If dual-branch, also set depth_dit and cross_branch_attentions to train;
-        # freeze pipe.dit (RGB branch) to save memory — it acts as a frozen encoder.
+        # freeze pipe.dit (RGB branch) in stage-1; unfreeze for stage-2 joint finetune.
         if use_dual_branch:
             self.pipe.depth_dit.train()
             self.pipe.cross_branch_attentions.train()
@@ -107,11 +112,16 @@ class WanTrainingModule(DiffusionTrainingModule):
                 p.requires_grad_(True)
             for p in self.pipe.cross_branch_attentions.parameters():
                 p.requires_grad_(True)
-            # Freeze RGB dit
-            self.pipe.dit.eval()
-            for p in self.pipe.dit.parameters():
-                p.requires_grad_(False)
-            print("   RGB dit frozen (requires_grad=False).")
+            if freeze_rgb_dit:
+                self.pipe.dit.eval()
+                for p in self.pipe.dit.parameters():
+                    p.requires_grad_(False)
+                print("   RGB dit frozen (stage-1 depth-only training).")
+            else:
+                self.pipe.dit.train()
+                for p in self.pipe.dit.parameters():
+                    p.requires_grad_(True)
+                print("   RGB dit unfrozen (stage-2 joint finetuning).")
 
         # Store other configs
         self.use_gradient_checkpointing = use_gradient_checkpointing
@@ -226,6 +236,8 @@ if __name__ == "__main__":
     parser.add_argument("--use_dual_branch", action="store_true", help="Enable dual-branch RGB+depth DiT with cross-attention exchange.")
     parser.add_argument("--depth_pretrain_checkpoint", type=str, default=None, help="Path to pretrained depth-only DiT checkpoint for depth branch init.")
     parser.add_argument("--rgb_pretrain_checkpoint", type=str, default=None, help="Path to rgb-only pretrained checkpoint; loaded into pipe.dit then frozen.")
+    parser.add_argument("--freeze_rgb_dit", action="store_true", default=True, help="Freeze RGB dit in dual-branch mode (stage-1). Use --no-freeze_rgb_dit for stage-2 joint finetuning.")
+    parser.add_argument("--no-freeze_rgb_dit", dest="freeze_rgb_dit", action="store_false")
     args = parser.parse_args()
 
     if args.dataset == "RLinfNpyDataset":
@@ -277,6 +289,7 @@ if __name__ == "__main__":
         use_dual_branch=args.use_dual_branch,
         depth_pretrain_checkpoint=args.depth_pretrain_checkpoint,
         rgb_pretrain_checkpoint=args.rgb_pretrain_checkpoint,
+        freeze_rgb_dit=args.freeze_rgb_dit,
     )
     model_logger = ModelLogger(
         args.output_path,
