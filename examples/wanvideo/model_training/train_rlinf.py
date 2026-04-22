@@ -33,6 +33,7 @@ class WanTrainingModule(DiffusionTrainingModule):
         use_wow_checkpoint=False,
         use_dual_branch=False,         # new: enable RGB/depth dual-branch
         depth_pretrain_checkpoint=None, # new: optional separate pretrain for depth branch
+        rgb_pretrain_checkpoint=None,   # new: load rgb-only ckpt into pipe.dit then freeze it
     ):
         super().__init__()
         # Load models
@@ -45,15 +46,27 @@ class WanTrainingModule(DiffusionTrainingModule):
         if use_wow_checkpoint:
             wow_ckpt_path = "/opt/zsq/wow-world-model/dit_models/checkpoints/WoW-1-Wan-14B-600k/WoW_video_dit.pt"
             if os.path.exists(wow_ckpt_path):
-                print(f"🎯 Overwriting with WoW checkpoint: {wow_ckpt_path}")
+                print(f"Overwriting with WoW checkpoint: {wow_ckpt_path}")
                 state_dict = torch.load(wow_ckpt_path, map_location="cpu", weights_only=False)
                 msg = self.pipe.dit.load_state_dict(state_dict, strict=False)
-                print(f"✅ WoW checkpoint loaded. Missing: {len(msg.missing_keys)}, Unexpected: {len(msg.unexpected_keys)}")
+                print(f"WoW checkpoint loaded. Missing: {len(msg.missing_keys)}, Unexpected: {len(msg.unexpected_keys)}")
             else:
-                print(f"⚠️ WoW checkpoint not found at {wow_ckpt_path}, skipping.")
+                print(f"WoW checkpoint not found at {wow_ckpt_path}, skipping.")
         else:
-            print("🎯 Not using WoW checkpoint.")
+            print("Not using WoW checkpoint.")
         # --- Patch End ---
+
+        # --- RGB pretrain checkpoint (dual-branch freeze mode) ---
+        if rgb_pretrain_checkpoint is not None and os.path.exists(rgb_pretrain_checkpoint):
+            print(f"Loading RGB pretrain checkpoint into pipe.dit: {rgb_pretrain_checkpoint}")
+            from diffsynth.models import load_state_dict as _load_sd
+            sd = _load_sd(rgb_pretrain_checkpoint, torch_dtype=torch.bfloat16, device="cpu")
+            # strip common prefix if present
+            if all(k.startswith("pipe.dit.") for k in list(sd.keys())[:5]):
+                sd = {k[len("pipe.dit."):]: v for k, v in sd.items()}
+            msg = self.pipe.dit.load_state_dict(sd, strict=False)
+            print(f"   Missing: {len(msg.missing_keys)}, Unexpected: {len(msg.unexpected_keys)}")
+        # ---
 
         # --- Dual-branch setup ---
         self.use_dual_branch = use_dual_branch
@@ -85,7 +98,8 @@ class WanTrainingModule(DiffusionTrainingModule):
             enable_fp8_training=False,
         )
 
-        # If dual-branch, also set depth_dit and cross_branch_attentions to train
+        # If dual-branch, also set depth_dit and cross_branch_attentions to train;
+        # freeze pipe.dit (RGB branch) to save memory — it acts as a frozen encoder.
         if use_dual_branch:
             self.pipe.depth_dit.train()
             self.pipe.cross_branch_attentions.train()
@@ -93,6 +107,11 @@ class WanTrainingModule(DiffusionTrainingModule):
                 p.requires_grad_(True)
             for p in self.pipe.cross_branch_attentions.parameters():
                 p.requires_grad_(True)
+            # Freeze RGB dit
+            self.pipe.dit.eval()
+            for p in self.pipe.dit.parameters():
+                p.requires_grad_(False)
+            print("   RGB dit frozen (requires_grad=False).")
 
         # Store other configs
         self.use_gradient_checkpointing = use_gradient_checkpointing
@@ -206,6 +225,7 @@ if __name__ == "__main__":
     # Dual-branch arguments
     parser.add_argument("--use_dual_branch", action="store_true", help="Enable dual-branch RGB+depth DiT with cross-attention exchange.")
     parser.add_argument("--depth_pretrain_checkpoint", type=str, default=None, help="Path to pretrained depth-only DiT checkpoint for depth branch init.")
+    parser.add_argument("--rgb_pretrain_checkpoint", type=str, default=None, help="Path to rgb-only pretrained checkpoint; loaded into pipe.dit then frozen.")
     args = parser.parse_args()
 
     if args.dataset == "RLinfNpyDataset":
@@ -256,6 +276,7 @@ if __name__ == "__main__":
         use_wow_checkpoint=args.use_wow_checkpoint,
         use_dual_branch=args.use_dual_branch,
         depth_pretrain_checkpoint=args.depth_pretrain_checkpoint,
+        rgb_pretrain_checkpoint=args.rgb_pretrain_checkpoint,
     )
     model_logger = ModelLogger(
         args.output_path,
