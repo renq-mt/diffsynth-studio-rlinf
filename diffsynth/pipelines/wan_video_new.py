@@ -307,7 +307,6 @@ class WanVideoPipeline(BasePipeline):
 
             depth_training_target = self.scheduler.training_target(depth_input_latents, depth_noise, timestep)
 
-            inputs["depth_latents"] = depth_latents
             noise_pred_rgb, noise_pred_depth = self.model_fn(
                 **inputs, timestep=timestep,
                 depth_dit=self.depth_dit,
