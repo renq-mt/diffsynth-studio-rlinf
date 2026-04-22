@@ -298,7 +298,7 @@ class CrossBranchAttention(nn.Module):
         return o_proj(out)
 
     def forward(self, x_rgb: torch.Tensor, x_depth: torch.Tensor):
-        # Normalise inside _attn via dedicated norm layers
+        self.to(dtype=x_rgb.dtype)
         x_rgb_normed = self.norm_rgb(x_rgb)
         x_depth_normed = self.norm_depth(x_depth)
 
