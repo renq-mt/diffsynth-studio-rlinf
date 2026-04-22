@@ -5,6 +5,7 @@ from diffsynth import load_state_dict
 from diffsynth.pipelines.wan_video_new import WanVideoPipeline, ModelConfig
 from diffsynth.trainers.utils import DiffusionTrainingModule, ModelLogger, launch_training_task, wan_parser
 from diffsynth.trainers.utils import RLinfNpyDataset, LiberoRGBDDataset
+from diffsynth.models.wan_video_dit import CrossBranchAttention
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 # --- Patch Start: 允许加载包含 set 的权重文件 ---
@@ -27,9 +28,11 @@ class WanTrainingModule(DiffusionTrainingModule):
         extra_inputs=None,
         max_timestep_boundary=1.0,
         min_timestep_boundary=0.0,
-        context_noise_sigma=0.0, # 新增参数
-        static_video_prob=0.0, # 新增参数
-        use_wow_checkpoint=False, # 新增参数
+        context_noise_sigma=0.0,
+        static_video_prob=0.0,
+        use_wow_checkpoint=False,
+        use_dual_branch=False,         # new: enable RGB/depth dual-branch
+        depth_pretrain_checkpoint=None, # new: optional separate pretrain for depth branch
     ):
         super().__init__()
         # Load models
@@ -37,15 +40,13 @@ class WanTrainingModule(DiffusionTrainingModule):
         if audio_processor_config is not None:
             audio_processor_config = ModelConfig(model_id=audio_processor_config.split(":")[0], origin_file_pattern=audio_processor_config.split(":")[1])
         self.pipe = WanVideoPipeline.from_pretrained(torch_dtype=torch.bfloat16, device="cpu", model_configs=model_configs, audio_processor_config=audio_processor_config)
-        
+
         # --- Patch Start: 加载 WoW 权重 ---
         if use_wow_checkpoint:
             wow_ckpt_path = "/opt/zsq/wow-world-model/dit_models/checkpoints/WoW-1-Wan-14B-600k/WoW_video_dit.pt"
             if os.path.exists(wow_ckpt_path):
                 print(f"🎯 Overwriting with WoW checkpoint: {wow_ckpt_path}")
-                # 使用 weights_only=False 避开报错
                 state_dict = torch.load(wow_ckpt_path, map_location="cpu", weights_only=False)
-                # 覆盖 pipe.dit 的权重
                 msg = self.pipe.dit.load_state_dict(state_dict, strict=False)
                 print(f"✅ WoW checkpoint loaded. Missing: {len(msg.missing_keys)}, Unexpected: {len(msg.unexpected_keys)}")
             else:
@@ -53,48 +54,73 @@ class WanTrainingModule(DiffusionTrainingModule):
         else:
             print("🎯 Not using WoW checkpoint.")
         # --- Patch End ---
+
+        # --- Dual-branch setup ---
+        self.use_dual_branch = use_dual_branch
+        if use_dual_branch:
+            import copy
+            print("🔀 Dual-branch mode: initializing depth_dit from RGB dit weights.")
+            # Deep-copy the RGB DiT as the depth branch starting point
+            self.pipe.depth_dit = copy.deepcopy(self.pipe.dit)
+            if depth_pretrain_checkpoint is not None and os.path.exists(depth_pretrain_checkpoint):
+                print(f"   Loading depth branch pretrain from: {depth_pretrain_checkpoint}")
+                sd = torch.load(depth_pretrain_checkpoint, map_location="cpu", weights_only=False)
+                msg = self.pipe.depth_dit.load_state_dict(sd, strict=False)
+                print(f"   Missing: {len(msg.missing_keys)}, Unexpected: {len(msg.unexpected_keys)}")
+            # Build one CrossBranchAttention per DiT block (zero-init output proj)
+            num_blocks = len(self.pipe.dit.blocks)
+            dim = self.pipe.dit.dim
+            num_heads = self.pipe.dit.blocks[0].num_heads
+            self.pipe.cross_branch_attentions = torch.nn.ModuleList([
+                CrossBranchAttention(dim=dim, num_heads=num_heads)
+                for _ in range(num_blocks)
+            ])
+            print(f"   CrossBranchAttention modules: {num_blocks} (dim={dim}, heads={num_heads})")
+        # ---
+
         # Training mode
         self.switch_pipe_to_training_mode(
             self.pipe, trainable_models,
             lora_base_model, lora_target_modules, lora_rank, lora_checkpoint=lora_checkpoint,
             enable_fp8_training=False,
         )
-        
+
+        # If dual-branch, also set depth_dit and cross_branch_attentions to train
+        if use_dual_branch:
+            self.pipe.depth_dit.train()
+            self.pipe.cross_branch_attentions.train()
+            for p in self.pipe.depth_dit.parameters():
+                p.requires_grad_(True)
+            for p in self.pipe.cross_branch_attentions.parameters():
+                p.requires_grad_(True)
+
         # Store other configs
         self.use_gradient_checkpointing = use_gradient_checkpointing
         self.use_gradient_checkpointing_offload = use_gradient_checkpointing_offload
         self.extra_inputs = extra_inputs.split(",") if extra_inputs is not None else []
         self.max_timestep_boundary = max_timestep_boundary
         self.min_timestep_boundary = min_timestep_boundary
-        self.context_noise_sigma = context_noise_sigma # 保存参数
-        self.static_video_prob = static_video_prob # 保存参数
+        self.context_noise_sigma = context_noise_sigma
+        self.static_video_prob = static_video_prob
 
-        
+
     def forward_preprocess(self, data):
-        # === 新增：静态样本增强 ===
-        # 如果启用，随机将当前样本变为“完全静止”，强迫模型学习背景保持
+        # === 静态样本增强 ===
         if self.training and self.static_video_prob > 0 and np.random.rand() < self.static_video_prob:
             first_frame = data["video"][0]
             data["video"] = [first_frame] * len(data["video"])
             if "action" in data:
                 data["action"] = torch.zeros_like(data["action"])
-                data["action"][:,-1] = -1  # 最后一维设为 -1
+                data["action"][:,-1] = -1
         # ============================
-        # CFG-sensitive parameters
-        # inputs_posi = {"prompt": data["prompt"]}
         inputs_posi = {}
         inputs_nega = {}
-        
-        # CFG-unsensitive parameters
+
         inputs_shared = {
-            # Assume you are using this pipeline for inference,
-            # please fill in the input parameters.
             "input_video": data["video"],
             "height": data["video"][0].size[1],
             "width": data["video"][0].size[0],
             "num_frames": len(data["video"]),
-            # Please do not modify the following parameters
-            # unless you clearly know what this will cause.
             "cfg_scale": 1,
             "tiled": False,
             "rand_device": self.pipe.device,
@@ -107,17 +133,12 @@ class WanTrainingModule(DiffusionTrainingModule):
             "idx":data["idx"] if "idx" in data else None,
         }
 
-        # Add action to inputs if it exists in data
         if "action" in data:
             assert torch.isfinite(data["action"]).all(), f"Action tensor has NaN/Inf. Shape: {data['action'].shape}, min: {data['action'].min()}, max: {data['action'].max()}"
             inputs_shared["action"] = data["action"]
-        
-        # Extra inputs
-        # print(f'====WanTrainingModule forward_preprocess extra_inputs: {self.extra_inputs}====')
-        # control_video, reference_image, etc.
+
         for extra_input in self.extra_inputs:
             if extra_input == "input_image":
-                # 在这里给 context frame 加噪
                 if self.context_noise_sigma > 0:
                     img_arr = np.array(data["video"][0]).astype(np.float32)
                     noise = np.random.normal(0, self.context_noise_sigma, img_arr.shape)
@@ -131,13 +152,36 @@ class WanTrainingModule(DiffusionTrainingModule):
                 inputs_shared[extra_input] = data[extra_input][0]
             else:
                 inputs_shared[extra_input] = data[extra_input]
-        
-        # Pipeline units will automatically process the input parameters.
+
         for unit in self.pipe.units:
             inputs_shared, inputs_posi, inputs_nega = self.pipe.unit_runner(unit, self.pipe, inputs_shared, inputs_posi, inputs_nega)
-        return {**inputs_shared, **inputs_posi}
-    
-    
+
+        processed = {**inputs_shared, **inputs_posi}
+
+        # --- Dual-branch: encode depth video and create depth noise ---
+        if self.use_dual_branch and "depth" in data:
+            depth_tensor = data["depth"].to(dtype=self.pipe.torch_dtype, device=self.pipe.device)
+            # depth_tensor: (T, 1, H, W) → expand to 3-ch and convert to PIL list for VAE encode
+            # Actually encode directly via VAE as a grayscale-to-latent pass.
+            # Replicate channel dim: (T, 1, H, W) -> (T, 3, H, W) so VAE can accept it.
+            depth_3ch = depth_tensor.expand(-1, 3, -1, -1)  # (T, 3, H, W)
+            # Convert to list of PIL Images for pipe.preprocess_video
+            depth_pil = []
+            for t in range(depth_3ch.shape[0]):
+                arr = (depth_3ch[t].permute(1, 2, 0).cpu().float().numpy() * 255).clip(0, 255).astype(np.uint8)
+                depth_pil.append(Image.fromarray(arr))
+            self.pipe.load_models_to_device(["vae"])
+            depth_video_tensor = self.pipe.preprocess_video(depth_pil).to(dtype=self.pipe.torch_dtype, device=self.pipe.device)
+            depth_input_latents = self.pipe.vae.encode(
+                depth_video_tensor, device=self.pipe.device, tiled=False
+            ).to(dtype=self.pipe.torch_dtype, device=self.pipe.device)
+            depth_noise = torch.randn_like(depth_input_latents)
+            processed["depth_input_latents"] = depth_input_latents
+            processed["depth_noise"] = depth_noise
+
+        return processed
+
+
     def forward(self, data, inputs=None):
         if inputs is None: inputs = self.forward_preprocess(data)
         models = {name: getattr(self.pipe, name) for name in self.pipe.in_iteration_models}
@@ -159,6 +203,9 @@ if __name__ == "__main__":
     parser.add_argument("--libero_image_size", type=int, nargs=2, default=[256, 256], help="Image size (H W) for LiberoRGBDDataset")
     parser.add_argument("--libero_action_dim", type=int, default=7, help="Action dimension for LiberoRGBDDataset")
     parser.add_argument("--libero_max_depth", type=float, default=5.0, help="Max depth value for LiberoRGBDDataset")
+    # Dual-branch arguments
+    parser.add_argument("--use_dual_branch", action="store_true", help="Enable dual-branch RGB+depth DiT with cross-attention exchange.")
+    parser.add_argument("--depth_pretrain_checkpoint", type=str, default=None, help="Path to pretrained depth-only DiT checkpoint for depth branch init.")
     args = parser.parse_args()
 
     if args.dataset == "RLinfNpyDataset":
@@ -169,8 +216,8 @@ if __name__ == "__main__":
         )
         val_dataset = RLinfNpyDataset(
             base_path=os.path.join(args.dataset_base_path, 'val_data'),
-            repeat=1, 
-            num_frames=args.num_frames 
+            repeat=1,
+            num_frames=args.num_frames
         )
     else:
         _libero_kwargs = dict(
@@ -181,15 +228,11 @@ if __name__ == "__main__":
             action_dim=args.libero_action_dim,
             max_depth=args.libero_max_depth,
         )
-        # Build val_dataset first so we can detect whether a fallback split occurred.
         val_dataset = LiberoRGBDDataset(**_libero_kwargs, split="validation", repeat=1)
-
         dataset = LiberoRGBDDataset(**_libero_kwargs, split="train", repeat=args.dataset_repeat)
-        # If val_dataset fell back to the train split (no dedicated validation split),
-        # trim train dataset to the first 90 % of episodes to avoid overlap.
         if val_dataset._fallback_split is not None:
             n_all = len(dataset.episodes)
-            val_ratio = dataset._fallback_val_ratio   # 0.1
+            val_ratio = dataset._fallback_val_ratio
             train_end = int(n_all * (1.0 - val_ratio))
             dataset.episodes = dataset.episodes[:train_end]
             print(f"[LiberoRGBDDataset] Auto-split (fallback): "
@@ -208,9 +251,11 @@ if __name__ == "__main__":
         extra_inputs=args.extra_inputs,
         max_timestep_boundary=args.max_timestep_boundary,
         min_timestep_boundary=args.min_timestep_boundary,
-        context_noise_sigma=args.context_noise_sigma, 
-        static_video_prob=args.static_video_prob, 
-        use_wow_checkpoint=args.use_wow_checkpoint, 
+        context_noise_sigma=args.context_noise_sigma,
+        static_video_prob=args.static_video_prob,
+        use_wow_checkpoint=args.use_wow_checkpoint,
+        use_dual_branch=args.use_dual_branch,
+        depth_pretrain_checkpoint=args.depth_pretrain_checkpoint,
     )
     model_logger = ModelLogger(
         args.output_path,

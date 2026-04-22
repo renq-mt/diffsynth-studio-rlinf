@@ -250,6 +250,83 @@ class GateModule(nn.Module):
     def forward(self, x, gate, residual):
         return x + gate * residual
 
+
+class CrossBranchAttention(nn.Module):
+    """Bidirectional cross-attention between RGB and depth branches.
+
+    Both projections are zero-initialized so the module is an identity
+    at init time — pretrained weights in the surrounding DiT blocks are
+    not disturbed at the start of fine-tuning.
+    """
+
+    def __init__(self, dim: int, num_heads: int, eps: float = 1e-6):
+        super().__init__()
+        self.num_heads = num_heads
+        # RGB attends to depth
+        self.norm_rgb = nn.LayerNorm(dim, eps=eps)
+        self.q_rgb = nn.Linear(dim, dim)
+        self.k_depth = nn.Linear(dim, dim)
+        self.v_depth = nn.Linear(dim, dim)
+        self.norm_k_rgb = nn.RMSNorm(dim // num_heads, eps=eps)
+        self.norm_q_rgb = nn.RMSNorm(dim // num_heads, eps=eps)
+        self.o_rgb = nn.Linear(dim, dim)
+        # Depth attends to RGB
+        self.norm_depth = nn.LayerNorm(dim, eps=eps)
+        self.q_depth = nn.Linear(dim, dim)
+        self.k_rgb = nn.Linear(dim, dim)
+        self.v_rgb = nn.Linear(dim, dim)
+        self.norm_k_depth = nn.RMSNorm(dim // num_heads, eps=eps)
+        self.norm_q_depth = nn.RMSNorm(dim // num_heads, eps=eps)
+        self.o_depth = nn.Linear(dim, dim)
+        # Zero-init output projections so module starts as identity
+        nn.init.zeros_(self.o_rgb.weight)
+        nn.init.zeros_(self.o_rgb.bias)
+        nn.init.zeros_(self.o_depth.weight)
+        nn.init.zeros_(self.o_depth.bias)
+
+    def _attn(self, q_proj, k_proj, v_proj, norm_q, norm_k, x_q, x_kv, o_proj):
+        q = norm_q(rearrange(q_proj(self.norm_rgb(x_q) if q_proj is self.q_rgb else self.norm_depth(x_q)),
+                             "b s (n d) -> b s n d", n=self.num_heads))
+        k = norm_k(rearrange(k_proj(x_kv), "b s (n d) -> b s n d", n=self.num_heads))
+        v = rearrange(v_proj(x_kv), "b s (n d) -> b s n d", n=self.num_heads)
+        # Use vanilla scaled dot-product attention (always available)
+        q_ = rearrange(q, "b s n d -> b n s d")
+        k_ = rearrange(k, "b s n d -> b n s d")
+        v_ = rearrange(v, "b s n d -> b n s d")
+        out = F.scaled_dot_product_attention(q_, k_, v_)
+        out = rearrange(out, "b n s d -> b s (n d)")
+        return o_proj(out)
+
+    def forward(self, x_rgb: torch.Tensor, x_depth: torch.Tensor):
+        # Normalise inside _attn via dedicated norm layers
+        x_rgb_normed = self.norm_rgb(x_rgb)
+        x_depth_normed = self.norm_depth(x_depth)
+
+        # RGB attends to depth
+        q = self.norm_q_rgb(rearrange(self.q_rgb(x_rgb_normed), "b s (n d) -> b s n d", n=self.num_heads))
+        k = self.norm_k_rgb(rearrange(self.k_depth(x_depth_normed), "b s (n d) -> b s n d", n=self.num_heads))
+        v = rearrange(self.v_depth(x_depth_normed), "b s (n d) -> b s n d", n=self.num_heads)
+        out_rgb = F.scaled_dot_product_attention(
+            rearrange(q, "b s n d -> b n s d"),
+            rearrange(k, "b s n d -> b n s d"),
+            rearrange(v, "b s n d -> b n s d"),
+        )
+        delta_rgb = self.o_rgb(rearrange(out_rgb, "b n s d -> b s (n d)"))
+
+        # Depth attends to RGB
+        q2 = self.norm_q_depth(rearrange(self.q_depth(x_depth_normed), "b s (n d) -> b s n d", n=self.num_heads))
+        k2 = self.norm_k_depth(rearrange(self.k_rgb(x_rgb_normed), "b s (n d) -> b s n d", n=self.num_heads))
+        v2 = rearrange(self.v_rgb(x_rgb_normed), "b s (n d) -> b s n d", n=self.num_heads)
+        out_depth = F.scaled_dot_product_attention(
+            rearrange(q2, "b s n d -> b n s d"),
+            rearrange(k2, "b s n d -> b n s d"),
+            rearrange(v2, "b s n d -> b n s d"),
+        )
+        delta_depth = self.o_depth(rearrange(out_depth, "b n s d -> b s (n d)"))
+
+        return x_rgb + delta_rgb, x_depth + delta_depth
+
+
 class DiTBlock(nn.Module):
     def __init__(self, has_image_input: bool, dim: int, num_heads: int, ffn_dim: int, eps: float = 1e-6):
         super().__init__()
