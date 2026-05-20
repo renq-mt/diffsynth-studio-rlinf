@@ -21,5 +21,4 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 accelerate launch \
   --libero_context_frames 5 \
   --libero_prediction_frames 8 \
   --libero_image_size 256 256 \
-  --libero_action_dim 7 \
-  --libero_max_depth 5.0
+  --libero_action_dim 7

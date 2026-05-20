@@ -178,6 +178,7 @@ class WanVideoPipeline(BasePipeline):
         self.dit2: WanModel = None
         self.depth_dit: WanModel = None          # depth branch DiT
         self.cross_branch_attentions: torch.nn.ModuleList = None  # per-block cross-attn
+        self.freeze_rgb_dit: bool = False        # stage-1: freeze RGB dit
         self.vae: WanVideoVAE = None
         self.motion_controller: WanMotionControllerModel = None
         self.vace: VaceWanModel = None
@@ -248,8 +249,23 @@ class WanVideoPipeline(BasePipeline):
             loader = GeneralLoRALoader(torch_dtype=self.torch_dtype, device=self.device)
             loader.load(module, lora, alpha=alpha)
         
+    def _build_depth_y(self, depth_input_latents: torch.Tensor) -> torch.Tensor:
+        """构造 depth 条件帧 y，与 WanImageEmbeddingUnit 的 y 格式对齐：(B, 20, T_lat, H, W)。"""
+        B, C, T_lat, H_lat, W_lat = depth_input_latents.shape
+        num_pixel_frames = T_lat * 4 - 3
+        msk = torch.zeros(B, num_pixel_frames, H_lat, W_lat, device=depth_input_latents.device, dtype=depth_input_latents.dtype)
+        msk[:, 0] = 1.0
+        msk = torch.concat([msk[:, 0:1].repeat(1, 4, 1, 1), msk[:, 1:]], dim=1)
+        msk = msk.view(B, msk.shape[1] // 4, 4, H_lat, W_lat).transpose(1, 2)  # (B, 4, T_lat, H, W)
+        return torch.cat([msk, depth_input_latents], dim=1)  # (B, 20, T_lat, H, W)
+
     def training_loss(self, **inputs):
         # print(f'====WanVideoPipeline training_loss')
+        if (
+            len(self.scheduler.timesteps) != self.scheduler.num_train_timesteps
+            or not getattr(self.scheduler, "training", False)
+        ):
+            self.scheduler.set_timesteps(self.scheduler.num_train_timesteps, training=True)
         max_timestep_boundary = int(inputs.get("max_timestep_boundary", 1) * self.scheduler.num_train_timesteps)
         min_timestep_boundary = int(inputs.get("min_timestep_boundary", 0) * self.scheduler.num_train_timesteps)
         timestep_id = torch.randint(min_timestep_boundary, max_timestep_boundary, (1,))
@@ -312,6 +328,7 @@ class WanVideoPipeline(BasePipeline):
                 depth_dit=self.depth_dit,
                 cross_branch_attentions=self.cross_branch_attentions,
                 depth_latents=depth_latents,
+                freeze_rgb_dit=self.freeze_rgb_dit,
             )
 
             assert torch.isfinite(noise_pred_rgb).all(), f"noise_pred_rgb has NaN/Inf"
@@ -325,10 +342,14 @@ class WanVideoPipeline(BasePipeline):
                     return (loss * mask).sum() / mask.sum()
                 return loss.mean()
 
-            loss = _masked_loss(noise_pred_rgb, training_target) + \
-                   _masked_loss(noise_pred_depth, depth_training_target)
-            loss = loss * self.scheduler.training_weight(timestep)
-            return loss
+            loss_rgb = _masked_loss(noise_pred_rgb, training_target)
+            loss_depth = _masked_loss(noise_pred_depth, depth_training_target)
+            weight = self.scheduler.training_weight(timestep)
+            return {
+                "loss": (loss_rgb + loss_depth) * weight,
+                "loss_rgb": (loss_rgb * weight).detach(),
+                "loss_depth": (loss_depth * weight).detach(),
+            }
 
         # --- Single-branch (original) path ---
         noise_pred = self.model_fn(**inputs, timestep=timestep)
@@ -729,8 +750,12 @@ class WanVideoPipeline(BasePipeline):
         analyze_l1_distance: bool = False,
         accumulate_analysis: bool = False, # 新增：是否累积多次推理数据
         # B
-        batch_size: Optional[int] = None, 
+        batch_size: Optional[int] = None,
         bs_1: bool = True,
+        # Dual-branch: optional depth context frames (4 PIL images, grayscale or RGB)
+        input_depth4: Optional[list] = None,
+        # Dual-branch: single depth reference frame, parallel to input_image for RGB
+        depth_input_image: Optional[Image.Image] = None,
     ):
 
 
@@ -787,10 +812,52 @@ class WanVideoPipeline(BasePipeline):
 
 
         # Denoise
-        self.load_models_to_device(self.in_iteration_models)
+        _iter_models = list(self.in_iteration_models)
+        if self.depth_dit is not None:
+            _iter_models += ["depth_dit", "cross_branch_attentions"]
+        self.load_models_to_device(_iter_models)
         models = {name: getattr(self, name) for name in self.in_iteration_models}
         # Denoise
-        self.load_models_to_device(self.in_iteration_models)
+        self.load_models_to_device(_iter_models)
+
+        # --- Dual-branch: prepare depth latents ---
+        # Mirror WanVideoUnit_ImageEmbedderFused for the depth branch so inference-time
+        # anchoring matches training semantics:
+        #   - training:  depth_input_latents = VAE(full 13-frame depth video)
+        #                → latent[:, :, 0:1] = standalone first frame, [:, :, 1:2] = 4-frame compressed group
+        #                both anchored/near-clean in five_frame_condition branch
+        #   - inference: feed 1 first frame + 4 context frames = 5 pixel frames → 2 latent frames,
+        #                anchor depth_latents[:, :, 0:2] every denoising step
+        depth_latents = None
+        depth_context_latents = None  # kept clean to restore after each step; may span multiple latent frames
+        self._last_depth_frames = None
+        depth_y = None
+        if self.depth_dit is not None:
+            depth_latents = torch.randn_like(inputs_shared["latents"])
+            depth_pil_list = None
+            if depth_input_image is not None and input_depth4 is not None:
+                first = depth_input_image.convert("RGB") if depth_input_image.mode != "RGB" else depth_input_image
+                rest = [d.convert("RGB") if d.mode != "RGB" else d for d in input_depth4]
+                depth_pil_list = [first] + rest                 # 1 + 4 = 5 pixel frames → 2 latent frames
+            elif depth_input_image is not None:
+                first = depth_input_image.convert("RGB") if depth_input_image.mode != "RGB" else depth_input_image
+                depth_pil_list = [first]                        # single-frame fallback (1 latent frame)
+            elif input_depth4 is not None:
+                rest = [d.convert("RGB") if d.mode != "RGB" else d for d in input_depth4]
+                depth_pil_list = [rest[0]] + rest               # legacy fallback: duplicate rest[0] as standalone first
+
+            if depth_pil_list is not None:
+                self.load_models_to_device(["vae"])
+                depth_pil_list = [img.resize((width, height)) for img in depth_pil_list]
+                depth_vae_input = self.preprocess_video([depth_pil_list]).to(dtype=self.torch_dtype, device=self.device)
+                depth_vae_latents = self.vae.encode(
+                    depth_vae_input, device=self.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride
+                ).to(dtype=self.torch_dtype, device=self.device)
+                T0_depth = depth_vae_latents.shape[2]  # 2 when 5 frames fed; 1 when single frame
+                depth_latents[:, :, :T0_depth] = depth_vae_latents[:, :, :T0_depth]
+                depth_context_latents = depth_vae_latents[:, :, :T0_depth]
+                depth_y = self._build_depth_y(depth_vae_latents)
+            self.load_models_to_device(_iter_models)
 
         for progress_id, timestep in enumerate(progress_bar_cmd(self.scheduler.timesteps)):
             # Switch DiT if necessary
@@ -798,26 +865,61 @@ class WanVideoPipeline(BasePipeline):
                 self.load_models_to_device(self.in_iteration_models_2)
                 models["dit"] = self.dit2
                 models["vace"] = self.vace2
-                
+
             # Timestep
             timestep = timestep.unsqueeze(0).to(dtype=self.torch_dtype, device=self.device)
 
             # Inference
-            noise_pred_posi = self.model_fn(**models, **inputs_shared, **inputs_posi, timestep=timestep)
-  
+            if depth_latents is not None:
+                _result_posi = self.model_fn(
+                    **models, **inputs_shared, **inputs_posi, timestep=timestep,
+                    depth_dit=self.depth_dit,
+                    cross_branch_attentions=self.cross_branch_attentions,
+                    depth_latents=depth_latents,
+                    depth_y=depth_y,
+                )
+                if isinstance(_result_posi, tuple):
+                    noise_pred_posi, noise_pred_depth_posi = _result_posi
+                else:
+                    noise_pred_posi = _result_posi
+                    noise_pred_depth_posi = None
+            else:
+                noise_pred_posi = self.model_fn(**models, **inputs_shared, **inputs_posi, timestep=timestep)
+                noise_pred_depth_posi = None
+
             if cfg_scale != 1.0:
                 print(f'Performing classifier-free guidance with scale {cfg_scale}...')
                 if cfg_merge:
                     noise_pred_posi, noise_pred_nega = noise_pred_posi.chunk(2, dim=0)
                 else:
-                    noise_pred_nega = self.model_fn(**models, **inputs_shared, **inputs_nega, timestep=timestep)
+                    if depth_latents is not None:
+                        _result_nega = self.model_fn(
+                            **models, **inputs_shared, **inputs_nega, timestep=timestep,
+                            depth_dit=self.depth_dit,
+                            cross_branch_attentions=self.cross_branch_attentions,
+                            depth_latents=depth_latents,
+                            depth_y=depth_y,
+                        )
+                        noise_pred_nega = _result_nega[0] if isinstance(_result_nega, tuple) else _result_nega
+                    else:
+                        noise_pred_nega = self.model_fn(**models, **inputs_shared, **inputs_nega, timestep=timestep)
                 noise_pred = noise_pred_nega + cfg_scale * (noise_pred_posi - noise_pred_nega)
+                noise_pred_depth = noise_pred_depth_posi  # depth uses positive pass only
             else:
                 noise_pred = noise_pred_posi
+                noise_pred_depth = noise_pred_depth_posi
 
-            # Scheduler
+            # Scheduler — RGB
             inputs_shared["latents"] = self.scheduler.step(noise_pred, self.scheduler.timesteps[progress_id], inputs_shared["latents"])
-      
+
+            # Scheduler — depth (dual-branch)
+            if depth_latents is not None and noise_pred_depth is not None:
+                depth_latents = self.scheduler.step(noise_pred_depth, self.scheduler.timesteps[progress_id], depth_latents)
+                # Restore all T0_depth clean anchor frames (matches WanVideoUnit_ImageEmbedderFused anchor width for RGB).
+                if depth_context_latents is not None:
+                    T0_d = depth_context_latents.shape[2]
+                    depth_latents[:, :, :T0_d] = depth_context_latents
+
             if "first_frame_latents" in inputs_shared:
                 ff = inputs_shared["first_frame_latents"]   # [C, T0, H, W] 或 [B, C, T0, H, W]
                 if ff.dim() == 4:
@@ -837,10 +939,14 @@ class WanVideoPipeline(BasePipeline):
         # post-denoising, pre-decoding processing logic
         for unit in self.post_units:
             inputs_shared, _, _ = self.unit_runner(unit, self, inputs_shared, inputs_posi, inputs_nega)
-        # Decode
+        # Decode RGB
         self.load_models_to_device(['vae'])
         video = self.vae.decode(inputs_shared["latents"], device=self.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
         video = self.vae_output_to_video(video)
+        # Decode depth (dual-branch)
+        if depth_latents is not None:
+            depth_raw = self.vae.decode(depth_latents, device=self.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
+            self._last_depth_frames = self.vae_output_to_video(depth_raw)
         self.load_models_to_device([])
 
         if analyze_l1_distance:
@@ -1706,6 +1812,8 @@ def model_fn_wan_video(
     depth_dit: WanModel = None,
     cross_branch_attentions: torch.nn.ModuleList = None,
     depth_latents: torch.Tensor = None,
+    depth_y: torch.Tensor = None,
+    freeze_rgb_dit: bool = False,
     **kwargs,
 ):
 
@@ -1789,6 +1897,10 @@ def model_fn_wan_video(
     
     if y is not None and dit.require_vae_embedding:
         x = torch.cat([x, y], dim=1)
+    # Snapshot pure text context BEFORE RGB appends clip/action (depth will build its own using depth_dit's layers)
+    _text_context_snapshot = context.clone() if (_dual_branch and context is not None) else None
+    _timestep_raw = timestep.clone() if _dual_branch else None  # timestep is later overwritten in-place by RGB
+
     if clip_feature is not None and dit.require_clip_embedding:
         clip_embdding = dit.img_emb(clip_feature)
         if context is not None:
@@ -1811,6 +1923,24 @@ def model_fn_wan_video(
 
     if context is None and dit.TI2V3:
         context = torch.zeros(x.shape[0], 1, dit.dim, dtype=x.dtype, device=x.device)
+
+    # --- Dual-branch: depth_context uses depth_dit's own img_emb / action_mlp1, text part is shared ---
+    if _dual_branch:
+        depth_context = _text_context_snapshot  # shared text encoder output (modality-agnostic)
+        if clip_feature is not None and depth_dit.require_clip_embedding:
+            _depth_clip = depth_dit.img_emb(clip_feature)
+            depth_context = torch.cat([_depth_clip, depth_context], dim=1) if depth_context is not None else _depth_clip
+        if depth_dit.I2V or depth_dit.TI2V2 or depth_dit.TI2V1:
+            _a = action_raw.clone()
+            if isinstance(_a, np.ndarray):
+                _a = torch.from_numpy(_a)
+            _a = _a.to(dtype=x_depth.dtype, device=x_depth.device)
+            if _a.dim() == 2:
+                _a = _a.unsqueeze(0)
+            _depth_action_emb1 = depth_dit.action_mlp1(_a)
+            depth_context = torch.cat([depth_context, _depth_action_emb1], dim=1) if depth_context is not None else _depth_action_emb1
+        if depth_context is None and depth_dit.TI2V3:
+            depth_context = torch.zeros(x_depth.shape[0], 1, depth_dit.dim, dtype=x_depth.dtype, device=x_depth.device)
     
 
 
@@ -1825,6 +1955,12 @@ def model_fn_wan_video(
 
     # Depth branch patchify (reuse depth_dit.patch_embedding; same spatial structure)
     if _dual_branch:
+        assert control_camera_latents_input is None, \
+            "dual-branch + camera control not aligned: depth branch does not handle control_camera_latents_input."
+        assert reference_latents is None, \
+            "dual-branch + reference_latents not aligned: depth branch does not handle reference_latents."
+        if depth_y is not None and depth_dit.require_vae_embedding:
+            x_depth = torch.cat([x_depth, depth_y], dim=1)
         x_depth = depth_dit.patchify(x_depth)
 
 
@@ -1942,6 +2078,67 @@ def model_fn_wan_video(
     assert torch.isfinite(context).all(), "context before transformer blocks has NaN/Inf"
     assert torch.isfinite(t_mod).all(), "t_mod before transformer blocks has NaN/Inf"
 
+    # --- Dual-branch: depth_t / depth_t_mod / depth_freqs using depth_dit's own layers ---
+    if _dual_branch:
+        # action_emb2 for depth (TI2V2/TI2V3)
+        _depth_action_emb2 = None
+        if depth_dit.TI2V2 or depth_dit.TI2V3:
+            if not bs_1:
+                _a2 = action_raw.clone()
+                if isinstance(_a2, np.ndarray):
+                    _a2 = torch.from_numpy(_a2)
+                _a2 = _a2.to(dtype=depth_context.dtype, device=depth_context.device)
+                B_, T_, D_ = _a2.shape
+                first_ = _a2[:, 0:1, :].repeat(1, 3, 1)
+                _a2 = torch.cat([first_, _a2], dim=1)
+                B_, T4_, D4_ = _a2.shape
+                _a2 = _a2.reshape(B_, T4_ // 4, D4_ * 4)
+                _depth_action_emb2 = depth_dit.action_mlp2(_a2)
+            else:
+                _a2 = action_raw.clone()
+                if isinstance(_a2, np.ndarray):
+                    _a2 = torch.from_numpy(_a2)
+                _a2 = _a2.to(dtype=depth_context.dtype, device=depth_context.device)
+                _a2 = torch.cat([_a2[0:1].repeat(3, 1), _a2], dim=0)
+                _a2 = _a2.reshape(f, -1)
+                _depth_action_emb2 = depth_dit.action_mlp2(_a2)
+
+        # depth t / t_mod (parallel to RGB branches above; use depth_latents shape & depth_dit layers)
+        if depth_dit.seperated_timestep and fuse_vae_embedding_in_latents and depth_dit.five_frame_condition:
+            if not bs_1:
+                _dts = torch.concat([
+                    torch.zeros((2, depth_latents.shape[3] * depth_latents.shape[4] // 4), dtype=depth_latents.dtype, device=depth_latents.device),
+                    torch.ones((depth_latents.shape[2] - 2, depth_latents.shape[3] * depth_latents.shape[4] // 4), dtype=depth_latents.dtype, device=depth_latents.device) * _timestep_raw
+                ]).flatten()
+                depth_t = depth_dit.time_embedding(sinusoidal_embedding_1d(depth_dit.freq_dim, _dts).unsqueeze(0)).repeat(depth_latents.shape[0], 1, 1)
+                if (depth_dit.TI2V2 or depth_dit.TI2V3) and _depth_action_emb2 is not None:
+                    _dae = _depth_action_emb2.unsqueeze(2).repeat(1, 1, 64, 1).flatten(1, 2)
+                    depth_t = depth_t + _dae
+                depth_t_mod = depth_dit.time_projection(depth_t).unflatten(2, (6, depth_dit.dim))
+            else:
+                _dts = torch.concat([
+                    torch.zeros((2, depth_latents.shape[3] * depth_latents.shape[4] // 4), dtype=depth_latents.dtype, device=depth_latents.device),
+                    torch.ones((depth_latents.shape[2] - 2, depth_latents.shape[3] * depth_latents.shape[4] // 4), dtype=depth_latents.dtype, device=depth_latents.device) * _timestep_raw
+                ]).flatten()
+                depth_t = depth_dit.time_embedding(sinusoidal_embedding_1d(depth_dit.freq_dim, _dts).unsqueeze(0))
+                if (depth_dit.TI2V2 or depth_dit.TI2V3) and _depth_action_emb2 is not None:
+                    _dae = _depth_action_emb2.unsqueeze(0).unsqueeze(2).repeat(1, 1, 64, 1).flatten(1, 2)
+                    depth_t = depth_t + _dae
+                depth_t_mod = depth_dit.time_projection(depth_t).unflatten(2, (6, depth_dit.dim))
+        else:
+            depth_t = depth_dit.time_embedding(sinusoidal_embedding_1d(depth_dit.freq_dim, _timestep_raw))
+            depth_t_mod = depth_dit.time_projection(depth_t).unflatten(1, (6, depth_dit.dim))
+
+        # depth freqs (same spatial layout since f,h,w are shared post-patchify)
+        if depth_dit.five_frame_condition or depth_dit.one_frame_condition:
+            depth_freqs = torch.cat([
+                depth_dit.freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
+                depth_dit.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+                depth_dit.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
+            ], dim=-1).reshape(f * h * w, 1, -1).to(x_depth.device)
+        else:
+            depth_freqs = freqs  # fallback
+
 
     # VAP 
     if vap is not None:
@@ -1999,6 +2196,11 @@ def model_fn_wan_video(
             return custom_forward
         for block_id, block in enumerate(dit.blocks):
             t_layer_start = time.time()
+            # In stage-1 dual-branch, RGB DiT parameters are frozen via
+            # requires_grad=False, but we must keep gradients through RGB hidden
+            # states so loss_rgb can train earlier CrossBranchAttention modules.
+            # Do not detach x here: detaching before each frozen RGB block makes
+            # only the final RGB-side cross-attention receive RGB-loss gradients.
             # Block
             if vap is not None and block_id in vap.mot_layers_mapping:
                 if use_gradient_checkpointing_offload:
@@ -2039,25 +2241,24 @@ def model_fn_wan_video(
                     elif dit.I2V:
                         raise NotImplementedError("已弃用，请迁移至[TI2V]")
 
-            # Depth branch block (dual-branch mode)
+            # Depth branch block (dual-branch mode) — independent context / t_mod / freqs
             if _dual_branch:
                 depth_block = depth_dit.blocks[block_id]
-                # Depth branch uses same t_mod (shared timestep conditioning)
                 if use_gradient_checkpointing_offload:
                     with torch.autograd.graph.save_on_cpu():
                         x_depth = torch.utils.checkpoint.checkpoint(
                             create_custom_forward(depth_block),
-                            x_depth, context, t_mod, freqs,
+                            x_depth, depth_context, depth_t_mod, depth_freqs,
                             use_reentrant=False,
                         )
                 elif use_gradient_checkpointing:
                     x_depth = torch.utils.checkpoint.checkpoint(
                         create_custom_forward(depth_block),
-                        x_depth, context, t_mod, freqs,
+                        x_depth, depth_context, depth_t_mod, depth_freqs,
                         use_reentrant=False,
                     )
                 else:
-                    x_depth = depth_block(x_depth, context, t_mod, freqs)
+                    x_depth = depth_block(x_depth, depth_context, depth_t_mod, depth_freqs)
 
                 # Cross-branch attention exchange
                 xattn = cross_branch_attentions[block_id]
@@ -2112,7 +2313,7 @@ def model_fn_wan_video(
     x = dit.unpatchify(x, (f, h, w))
 
     if _dual_branch:
-        x_depth = depth_dit.head(x_depth, t)
+        x_depth = depth_dit.head(x_depth, depth_t)
         x_depth = depth_dit.unpatchify(x_depth, (f, h, w))
         return x, x_depth
 
