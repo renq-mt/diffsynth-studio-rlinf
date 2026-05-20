@@ -12,8 +12,23 @@ SUMMARY_KEYS = {
     "psnr_ssim": ["mean_psnr", "std_psnr", "mean_ssim", "std_ssim"],
     "latent_l2": ["mean_latent_l2", "std_latent_l2"],
     "depth": ["mean_depth_mae", "std_depth_mae", "mean_depth_rmse", "std_depth_rmse", "mean_depth_absrel"],
+    "depth_accuracy": [
+        "mean_depth_accuracy_absrel",
+        "std_depth_accuracy_absrel",
+        "mean_depth_accuracy_score",
+        "std_depth_accuracy_score",
+    ],
+    "trajectory_accuracy": ["mean_ndtw", "std_ndtw", "mean_ndtw_normalized", "std_ndtw_normalized"],
     "fid": ["fid"],
     "fvd": ["fvd", "backend", "styleganv_metric"],
+    "qwen_vl_action_quality": [
+        "mean_Interaction_Quality",
+        "std_Interaction_Quality",
+        "mean_Perspectivity",
+        "std_Perspectivity",
+        "mean_Instruction_Following",
+        "std_Instruction_Following",
+    ],
 }
 
 
@@ -37,6 +52,8 @@ def collect_results(metrics_dir: Path) -> Dict:
 
     for path in metric_files:
         data = load_json(path)
+        if not isinstance(data, dict):
+            continue
         metric = data.get("metric", path.stem)
         summary.update(flatten_metric(data))
         for item in data.get("per_sample", []):
