@@ -328,9 +328,11 @@ class TaskEmbedResnetRewModel(nn.Module):
                     checkpoint_path=None,
                     num_tasks: int = 10, 
                     task_embed_dim: int = 64, 
-                    task_suite_name: str = "libero_goal") -> None:
+                    task_suite_name: str = "libero_goal",
+                    input_channels: int = 3) -> None:
         super().__init__()
-        b1 = nn.Sequential(nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3),
+        self.input_channels = input_channels
+        b1 = nn.Sequential(nn.Conv2d(input_channels, 64, kernel_size=7, stride=2, padding=3),
                    nn.BatchNorm2d(64), nn.ReLU(),
                    nn.MaxPool2d(kernel_size=3, stride=2, padding=1))
         b2 = nn.Sequential(*resnet_block(64, 64, 2, first_block=True))
@@ -351,7 +353,6 @@ class TaskEmbedResnetRewModel(nn.Module):
             nn.ReLU(),
             nn.Dropout(0.1),
             nn.Linear(256, 1),
-            nn.Sigmoid()
         )
 
         self.task_suite_name = task_suite_name
@@ -360,41 +361,38 @@ class TaskEmbedResnetRewModel(nn.Module):
         if checkpoint_path is not None:
             self.load_checkpoint(checkpoint_path)
 
+    def forward_logits(self, obs, instruction=None, task_id=None):
+        """Differentiable training path. Returns unnormalized reward logits."""
+        obs = obs.clamp(-1.0, 1.0).to(dtype=torch.float32)
+
+        if task_id is None:
+            task_id = instruction_to_task_id(instruction, self.task_suite_name)
+        if not torch.is_tensor(task_id):
+            task_id = torch.tensor(task_id, dtype=torch.long)
+        task_id = task_id.to(device=obs.device, dtype=torch.long)
+
+        visual_features = self.visual_encoder(obs)
+        task_embed = self.task_embedding(task_id)
+        combined_features = torch.cat([visual_features, task_embed], dim=1)
+        return self.fusion_layer(combined_features)
+
+    def forward_prob(self, obs, instruction=None, task_id=None):
+        """Differentiable probability path for metrics and calibration."""
+        return torch.sigmoid(self.forward_logits(obs, instruction=instruction, task_id=task_id))
+
     @torch.no_grad()
     def predict_rew(self, obs, instruction):
         """
         Args:
-            obs: (batch_size, 3, height, width) 图像输入，范围 [-1, 1]
+            obs: (batch_size, C, height, width) 图像输入，范围 [-1, 1]
             instruction: str or list of str - 任务的自然语言描述
         
         Returns:
             reward: (batch_size, 1) 预测的奖励值，范围 [0, 1]
                    如果需要二值输出，在外部调用 torch.round()
         """
-        # 使用 clamp 而不是 assert，避免运行时错误（与RewModel保持一致）
-        obs = obs.clamp(-1.0, 1.0)
-        
-        # 转换instruction为task_id
-        task_id = instruction_to_task_id(instruction, self.task_suite_name)
-        if obs.device.type != 'cpu':
-            task_id = task_id.to(obs.device)
-        
-        # 提取视觉特征
-        visual_features = self.visual_encoder(obs.to(dtype=torch.float32))  # (batch_size, 512)
-
-        # 获取任务嵌入
-        task_embed = self.task_embedding(task_id)  # (batch_size, task_embed_dim)
-        
-        # 拼接视觉特征和任务嵌入
-        combined_features = torch.cat([visual_features, task_embed], dim=1)  # (batch_size, 512 + task_embed_dim)
-        
-        # 预测奖励
-        reward = self.fusion_layer(combined_features)
-        
-        # 可选：如果需要与RewModel完全一致，返回二值结果
-        reward = torch.round(reward)
-        
-        return reward
+        prob = self.forward_prob(obs, instruction=instruction)
+        return torch.round(prob)
 
     def forward(self, obs=None, instruction=None):
         """
